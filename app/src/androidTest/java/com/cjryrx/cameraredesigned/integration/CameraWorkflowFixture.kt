@@ -1,6 +1,7 @@
 package com.cjryrx.cameraredesigned.integration
 
 import android.Manifest
+import android.app.KeyguardManager
 import android.content.ContentUris
 import android.content.res.Configuration
 import android.graphics.BitmapFactory
@@ -9,6 +10,7 @@ import android.graphics.Rect
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
 import android.net.Uri
+import android.os.PowerManager
 import android.os.SystemClock
 import android.provider.MediaStore
 import android.provider.MediaStore.MediaColumns
@@ -24,12 +26,14 @@ import androidx.test.platform.app.InstrumentationRegistry
 import com.cjryrx.cameraredesigned.CameraApplication
 import com.cjryrx.cameraredesigned.CameraViewModel
 import com.cjryrx.cameraredesigned.MainActivity
+import com.cjryrx.cameraredesigned.camera.probe.CameraProbeActivity
 import com.cjryrx.cameraredesigned.data.Preferences
 import com.cjryrx.cameraredesigned.domain.BurstRate
 import com.cjryrx.cameraredesigned.domain.CameraSettings
 import com.cjryrx.cameraredesigned.domain.ShootingMode
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
@@ -51,37 +55,63 @@ abstract class CameraWorkflowFixture {
         assumeTrue("Use -PisolatedDeviceTests=true for gallery-writing tests",
             app.packageName == "com.cjryrx.cameraredesigned.acceptance")
         instrumentation.uiAutomation.grantRuntimePermission(app.packageName, Manifest.permission.CAMERA)
-        val original = runBlocking {
-            withTimeout(30_000) {
-                // Wait for any earlier journal recovery before attributing new rows to this test.
+        // A large journal from a previous interrupted run must recover while the process is visible.
+        // The debug probe keeps the screen on and never opens a camera until explicitly requested.
+        val original = ActivityScenario.launch(CameraProbeActivity::class.java).use { guard ->
+            guard.onActivity { check(it.foreground.value) { "Recovery requires a foreground activity" } }
+            stage("waiting for previous capture recovery") {
                 app.processing.reserve()
                 app.processing.releaseReservation()
                 app.processing.state.first { it.count == 0 }
-                app.repository.load()
+            }
+            baseline = ownedPhotos()
+            val saved = stage("reading original preferences") { app.repository.load() }
+            stage("setting up capture mode") { app.repository.save(Preferences(CameraSettings(shootingMode = mode, burstRate = BurstRate.LOW))) }
+            saved
+        }
+        var restored = false
+        val restore = AutoCloseable {
+            if (!restored) {
+                stage("restoring original preferences") { app.repository.save(original) }
+                restored = true
             }
         }
-        baseline = ownedPhotos()
-        try {
-            runBlocking { app.repository.save(Preferences(CameraSettings(shootingMode = mode, burstRate = BurstRate.LOW))) }
+        restore.use {
             ActivityScenario.launch(MainActivity::class.java).use {
                 scenario = it
                 scenario.onActivity { activity -> model = ViewModelProvider(activity)[CameraViewModel::class.java] }
-                waitFor("camera open") { model.state.value.cameraReady }
-                block()
-            }
-        } finally {
-            try {
-                runBlocking {
-                    withTimeout(30_000) {
-                        if (::model.isInitialized) model.state.first { !it.shooting }
+                // Keep MainActivity resumed until every asserted capture is finished and accounted for.
+                // use() suppresses cleanup failures onto the real test failure instead of hiding it.
+                val cleanup = AutoCloseable {
+                    stage("draining capture and photo processing") {
+                        model.state.first { !it.shooting }
                         app.processing.state.first { it.count == 0 }
                     }
+                    newPhotos().forEach { uri -> assertEquals("Remove test photo $uri", 1, app.contentResolver.delete(uri, null, null)) }
                 }
-                newPhotos().forEach { uri -> assertEquals("Remove test JPEG $uri", 1, app.contentResolver.delete(uri, null, null)) }
-            } finally {
-                runBlocking { app.repository.save(original) }
+                restore.use {
+                    cleanup.use {
+                        waitFor("camera open") { model.state.value.cameraReady }
+                        block()
+                    }
+                }
             }
         }
+    }
+
+    private fun <T> stage(name: String, operation: suspend () -> T): T = runBlocking {
+        try { withTimeout(30_000) { operation() } }
+        catch (timeout: TimeoutCancellationException) {
+            throw AssertionError("Timed out $name; ${queueDiagnostic()}", timeout)
+        }
+    }
+
+    private fun queueDiagnostic(): String {
+        val files = app.processing.directory.listFiles().orEmpty().sortedBy { it.name }
+            .take(16).joinToString { "${it.name}:${it.length()}" }
+        return "queue=${app.processing.state.value}, work=[$files], " +
+            "interactive=${app.getSystemService(PowerManager::class.java).isInteractive}, " +
+            "locked=${app.getSystemService(KeyguardManager::class.java).isKeyguardLocked}"
     }
 
     protected fun orient(request: Int, orientation: Int) {
@@ -222,7 +252,7 @@ abstract class CameraWorkflowFixture {
         } while (SystemClock.uptimeMillis() < end)
         val nodes = mutableListOf<String>()
         findBounds(diagnostic = nodes)
-        fail("Timed out waiting for $message; app accessibility nodes=$nodes; ${model.state.value}")
+        fail("Timed out waiting for $message; ${queueDiagnostic()}; app accessibility nodes=$nodes; ${model.state.value}")
     }
 
     protected fun newPhotos() = ownedPhotos() - baseline

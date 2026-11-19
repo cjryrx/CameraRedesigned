@@ -1,12 +1,13 @@
 package com.cjryrx.cameraredesigned.imaging
 
-import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.BitmapRegionDecoder
 import android.graphics.Canvas
 import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.Rect
+import androidx.core.graphics.createBitmap
+import androidx.core.graphics.withClip
 import kotlin.math.abs
 import kotlin.math.ceil
 import kotlin.math.floor
@@ -35,7 +36,7 @@ internal fun readWarpedRegion(
         return pixels
     }
 
-    val stripe = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+    val stripe = createBitmap(width, height)
     try {
         val canvas = Canvas(stripe)
         val paint = Paint(Paint.FILTER_BITMAP_FLAG)
@@ -63,10 +64,9 @@ internal fun readWarpedRegion(
                     (-t.b*inv).toFloat(), (t.a*inv).toFloat(), ((-t.b*ox+t.a*oy)*inv-region.top).toFloat(),
                     0f, 0f, 1f,
                 ))
-                canvas.save()
-                canvas.clipRect(left, 0, right, height)
-                canvas.drawBitmap(tile, matrix, paint)
-                canvas.restore()
+                canvas.withClip(left.toFloat(), 0f, right.toFloat(), height.toFloat()) {
+                    drawBitmap(tile, matrix, paint)
+                }
             } finally { tile.recycle() }
         }
         stripe.getPixels(pixels, 0, width, 0, 0, width, height)

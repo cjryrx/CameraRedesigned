@@ -102,7 +102,13 @@ class BurstPipelineTest {
         assertFalse(outcome.isCompleted)
         signals[1].complete(Result.success(1))
         signals[2].complete(Result.success(2))
-        assertSame(expected, withTimeout(2_000) { outcome.await() }.exceptionOrNull())
+        val actual = requireNotNull(withTimeout(2_000) { outcome.await() }.exceptionOrNull())
+        // Coroutine debug mode copies exceptions across suspension boundaries to recover stacks.
+        // The failure contract is the original type/message/cause, not the wrapper's identity.
+        assertEquals(expected.javaClass, actual.javaClass)
+        assertEquals(expected.message, actual.message)
+        assertTrue("The first failure must remain the original cause",
+            generateSequence(actual) { it.cause }.any { it === expected })
         assertEquals(listOf(0, 1, 2), delivered)
         assertEquals(3, submitted.size)
     }
